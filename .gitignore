@@ -1,0 +1,43 @@
+# Environments
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Logs / outputs
+logs/
+outputs/
+render_debug/
+
+# Weights / checkpoints
+checkpoints/
+checkpoints_*/
+*.pth
+*.pt
+
+# Experiment tracking
+wandb/
+
+# Datasets / large assets
+Baseline/
+annotations/
+smpl_models/
+
+*.npy
+*.npz
+*.ply
+
+# Local scripts not part of repo
+start_claude.sh
+sync_wandb_*.sh
+download_obs.sh
+upload_obs.sh
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+.claude
