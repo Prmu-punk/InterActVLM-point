@@ -86,11 +86,6 @@ class IVDDataset(Dataset):
             use_pca=False,
             num_betas=10
         )
-        self.human_keypoint_indices = None
-        if self.keypoint_manager is not None:
-            self.human_keypoint_indices = np.array(
-                self.keypoint_manager.get_vertex_indices(), dtype=np.int64
-            )
         
     
     def _get_sample_dir(self, sample_id: str) -> Path:
@@ -361,75 +356,25 @@ class IVDDataset(Dataset):
 
         return labels
     
-    def _map_object_index_from_pair(self, pair: Dict, object_data: Dict) -> int:
-        """Map annotation object index/coord to the sampled point-cloud index."""
-        sampled_points = object_data['points']
-        sampled_indices = object_data.get('indices')
+    def _get_object_coords(self, annotation: Dict) -> Tuple[np.ndarray, int]:
+        """Get object contact coordinates."""
+        coords_list = []
+        if 'object_contact_coords' in annotation:
+            coords_list = annotation['object_contact_coords']
+        elif 'keypoint_object_pairs' in annotation:
+            coords_list = [p.get('object_coord') for p in annotation.get('keypoint_object_pairs', [])]
 
-        obj_idx = pair.get('object_index')
-        if isinstance(obj_idx, int):
-            if sampled_indices is None:
-                if 0 <= obj_idx < sampled_points.shape[0]:
-                    return int(obj_idx)
-            else:
-                matches = np.where(sampled_indices == obj_idx)[0]
-                if matches.size > 0:
-                    return int(matches[0])
-
-        obj_coord = pair.get('object_coord')
-        if obj_coord is None:
-            return -100
-
-        coord = np.array(obj_coord, dtype=np.float32).reshape(3)
-        centroid = object_data.get('centroid')
-        if centroid is not None:
-            coord = coord - centroid
-        max_radius = float(object_data.get('max_radius', 1.0))
-        if max_radius > 0:
-            coord = coord / max_radius
-
-        if sampled_points.shape[0] == 0:
-            return -100
-        dists = np.linalg.norm(sampled_points - coord[None, :], axis=1)
-        return int(np.argmin(dists))
-
-    def _get_object_indices(self, annotation: Dict, human_labels: np.ndarray, object_data: Dict) -> np.ndarray:
-        """
-        Get object point indices aligned with 87 keypoint queries.
-        Non-contact/invalid targets are set to -100 (ignore_index).
-        """
-        indices = np.full((self.num_object_queries,), -100, dtype=np.int64)
-
-        pairs = annotation.get('keypoint_object_pairs', [])
-        if isinstance(pairs, list) and len(pairs) > 0:
-            for pair in pairs:
-                kp_idx = pair.get('keypoint_idx')
-                if not isinstance(kp_idx, int):
-                    continue
-                if kp_idx < 0 or kp_idx >= self.num_object_queries:
-                    continue
-                mapped_idx = self._map_object_index_from_pair(pair, object_data)
-                if mapped_idx >= 0:
-                    indices[kp_idx] = mapped_idx
-            indices[human_labels[:self.num_object_queries] <= 0.5] = -100
-            return indices
-
-        # Fallback: if only contact indices are available, align them to positive human keypoints in order.
-        contact_indices = annotation.get('object_contact_index')
-        if isinstance(contact_indices, list) and len(contact_indices) > 0:
-            pos_kp = np.where(human_labels[:self.num_object_queries] > 0.5)[0]
-            for i, obj_idx in enumerate(contact_indices):
-                if i >= len(pos_kp):
-                    break
-                if isinstance(obj_idx, int):
-                    pair = {'object_index': int(obj_idx)}
-                    mapped_idx = self._map_object_index_from_pair(pair, object_data)
-                    if mapped_idx >= 0:
-                        indices[int(pos_kp[i])] = mapped_idx
-
-        # Only supervise object index for human-contact-positive keypoints.
-        indices[human_labels[:self.num_object_queries] <= 0.5] = -100
-        return indices
+        if coords_list:
+            num_valid = len(coords_list)
+            coords = np.array(coords_list, dtype=np.float32)
+            if len(coords) < self.num_object_queries:
+                padding = np.zeros((self.num_object_queries - len(coords), 3), dtype=np.float32)
+                coords = np.concatenate([coords, padding], axis=0)
+            elif len(coords) > self.num_object_queries:
+                coords = coords[:self.num_object_queries]
+                num_valid = self.num_object_queries
+            return coords, num_valid
+        return np.zeros((self.num_object_queries, 3), dtype=np.float32), 0
     
     def __len__(self) -> int:
         return len(self.sample_ids)
@@ -446,7 +391,7 @@ class IVDDataset(Dataset):
                 - human_vertices: (V, 3) human mesh vertices
                 - object_points: (N, 3) object point cloud
                 - human_labels: (87,) binary contact labels
-                - object_indices: (K,) object point indices (-100 for ignore)
+                - object_coords: (K, 3) object contact coordinates
         """
         sample_id = self.sample_ids[idx]
         
@@ -455,22 +400,16 @@ class IVDDataset(Dataset):
         human_data = self._load_human_data(sample_id)
         object_data = self._load_object_data(sample_id)
         annotation = self._load_annotation(sample_id)
-        
-        # Get labels
         human_labels = self._get_human_labels(human_data, annotation)
-        object_indices = self._get_object_indices(annotation, human_labels, object_data)
-        
-        # Build sample
+        object_coords, object_coords_valid = self._get_object_coords(annotation)
         sample = {
             'sample_id': sample_id,
             'rgb_image': rgb_image,
             'human_vertices': human_data['vertices'],
             'object_points': object_data['points'],
             'human_labels': human_labels,
-            'object_indices': object_indices
+            'object_coords': object_coords
         }
-        if self.human_keypoint_indices is not None:
-            sample['human_keypoint_indices'] = self.human_keypoint_indices
 
         if self.load_contact_masks:
             human_mask, object_mask = self._load_contact_masks(
@@ -484,6 +423,12 @@ class IVDDataset(Dataset):
             sample['object_contact_mask'] = object_mask
         if self.transform is not None:
             sample = self.transform(sample)
+
+        if 'object_coords' not in sample:
+            raise KeyError(
+                f"Missing object_coords in sample {sample_id}. "
+                f"Check annotation at {self.annot_data / f'{sample_id}.json'}"
+            )
         
         return sample
 
@@ -498,6 +443,10 @@ def collate_fn(batch: List[Dict]) -> Dict:
     Returns:
         Batched dictionary
     """
+    if any('object_coords' not in s for s in batch):
+        missing = [s.get('sample_id', '<unknown>') for s in batch if 'object_coords' not in s]
+        raise KeyError(f"Missing object_coords for samples: {missing}")
+
     result = {}
     
     # String fields
@@ -506,7 +455,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
     # Tensor fields
     tensor_keys = [
         'rgb_image', 'human_vertices',
-        'object_points', 'human_labels', 'object_indices', 'human_keypoint_indices',
+        'object_points', 'human_labels', 'object_coords',
         'human_contact_mask', 'object_contact_mask'
     ]
     

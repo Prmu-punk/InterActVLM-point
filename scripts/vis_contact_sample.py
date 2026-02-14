@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 from typing import Tuple
 
 import numpy as np
@@ -11,8 +12,14 @@ try:
 except Exception:
     _HAS_CKDTREE = False
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from data import dataset as dataset_mod
 from data.dataset import create_dataloaders
 from models import build_model
+import models as models_mod
 from utils.keypoints import KeypointManager
 
 
@@ -57,6 +64,17 @@ def main():
     parser.add_argument('--keypoints_json', type=str, default='data/part_kp.json')
     parser.add_argument('--threshold', type=float, default=0.5)
     args = parser.parse_args()
+
+    if not os.path.abspath(dataset_mod.__file__).startswith(REPO_ROOT):
+        raise RuntimeError(
+            f"Imported data.dataset from {dataset_mod.__file__}, "
+            f"expected under {REPO_ROOT}"
+        )
+    if not os.path.abspath(models_mod.__file__).startswith(REPO_ROOT):
+        raise RuntimeError(
+            f"Imported models from {models_mod.__file__}, "
+            f"expected under {REPO_ROOT}"
+        )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -120,15 +138,13 @@ def main():
     # Predicted discrete contacts (human labels + object point indices)
     pred_human = outputs['human_contact'][0].cpu().numpy()
     pred_human_mask = pred_human > args.threshold
-    pred_object_idx = outputs['object_index_logits'][0].argmax(dim=-1).cpu().numpy()
+    object_coords = outputs['object_coords'][0].cpu().numpy()
 
     keypoints = KeypointManager(args.keypoints_json)
     kp_idx = keypoints.get_vertex_indices()
     human_87 = human_vertices[kp_idx]
     human_87_contact = human_87[:87][pred_human_mask]
-    selected_obj_idx = pred_object_idx[pred_human_mask]
-    selected_obj_idx = selected_obj_idx[(selected_obj_idx >= 0) & (selected_obj_idx < object_points.shape[0])]
-    object_coords_contact = object_points[selected_obj_idx] if selected_obj_idx.size > 0 else np.zeros((0, 3), dtype=np.float32)
+    object_coords_contact = object_coords[pred_human_mask]
 
     save_ply(human_87_contact, os.path.join(args.output_dir, 'human_keypoints_contact.ply'))
     save_ply(object_coords_contact, os.path.join(args.output_dir, 'object_coords_contact.ply'))
